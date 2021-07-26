@@ -1,5 +1,5 @@
 const std = @import("std");
-
+const IniParser = @import("./parser.zig").IniParser;
 // entries
 // entry can be iter section or key 
 
@@ -28,6 +28,25 @@ pub const Config = struct {
             }
         }
         self.entries.deinit();
+    }
+    
+    pub fn parse(self: *Self, path: []const u8) !void {
+        const content = try std.fs.cwd().readFileAlloc(self.alloc, path, std.math.maxInt(usize));
+        try self.parseString(content);
+    }
+
+    pub fn parseString(self: *Self, content: []const u8) !void {
+        var parser = IniParser.init(self.alloc, content);
+        defer parser.deinit();
+        try parser.parse(self);
+    }
+
+    pub fn dump() !void {
+
+    }
+
+    pub fn dumpString() ![]const u8 {
+
     }
 };
 
