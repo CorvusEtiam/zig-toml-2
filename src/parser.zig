@@ -1,4 +1,5 @@
 // load `ini` namespace
+const std  = @import("std");
 const Lexer = @import("./lexer.zig").Lexer;
 const ini = @import("./ini.zig");
 
@@ -43,18 +44,20 @@ const Tokenizer = struct {
     lexer: Lexer,
     start_token: usize = 0,
     empty: bool = false,
+    alloc: *std.mem.Allocator = undefined,
 
-    pub fn init(content: []const u8) Self {
+    pub fn init(alloc: *std.mem.Allocator, content: []const u8) Self {
         return .{
             .lexer = Lexer.init(content),
+            .alloc = alloc,
         };
     }
 
-    fn createToken(self: *Self, tok_type: TokenType) Token {
-        return .{ .span = self.lexer.sliceFrom(self.start_token), .tok_type = tok_type };
+    fn createToken(self: *Self, tok_type: TokenType) !Token {
+        return .{ .span = try std.mem.dupe(u8, self.lexer.sliceFrom(self.start_token)), .tok_type = tok_type };
     }
 
-    pub fn getToken(self: *Self) ?Token {
+    pub fn getToken(self: *Self) !?Token {
         if ( self.lexer.isEof() ) {
             if ( self.empty ) { 
                 return null; 
@@ -110,30 +113,27 @@ const Tokenizer = struct {
         }
     }
 
-    pub fn consumeToken(self: *Self) !void {
-
-    }
-    pub fn expectToken(self: *Self) !Token {
-
+    pub fn expectToken(self: *Self, tok_type: TokenType) !Token {
+        if ( self.getToken() ) | tok | {
+            if ( tok.tok_type == tok_type ) return tok;
+        } return error.unexpectedToken;
     }
 };
+
 
 pub const IniParser = struct {
     const Self = @This();
     pub const IniParserError = error {
         unexpectedCharacter,
+        unexpectedToken,
     };
-    const ParserState = enum {
-        inSectionHeader,
-        inKey,
-        inValue,
-        inErrorState,
-    };
+    
     // no default values -- it requires that struct should be created with `init`&`deinit` pair
     alloc: *std.mem.Allocator,
     tokenizer: Tokenizer,
-    current_state: ParserState = .inKey,
-    last_section: *Section = undefined,
+    line_number: usize = 0,
+    root: *ini.Table = undefined,
+    context: *ini.Table = undefined,
 
     pub fn init(alloc: *std.mem.Allocator, content: []const u8) !Self {
         return .{
@@ -146,69 +146,114 @@ pub const IniParser = struct {
         // deinitialization code
     }
 
-    fn parseTableHeader(self: *Self, current_token_or_null: ?Token, section: *Section) !*Section {
-        // base case
-        const current_token = current_token_or_null orelse { return error.unexpectedCharacter; };
-        if ( current_token.tok_type == .rightBracket ) {
-            return section;
-        }
-        if ( current_token.tok_type == .dot ) {
-            const new_token = try self.tokenizer.expectToken(.keyLike);
-            var new_section = self.createSection();
-            try section.entries.put(next_token.span, .{ .section = new_section });
-            return self.parseTableHeader(self.tokenizer.getToken(), new_section);
-        }
-    }
-    
-    fn parseExpression(self: *Self, current_token: Token, output: *Ini) !void {
-        switch ( current_token.tok_type ) {
-            .comment => { 
-                // # comment
-                return;
-                
-            },
-            .keyLike => {
-                // key = value
-                const key = current_token.span;
-                try self.tokenizer.consumeToken(.whitespace); 
-                try self.tokenizer.consumeToken(.keyValSep);
-                try self.tokenizer.consumeToken(.whitespace);
-                const value_or_null = self.tokenizer.getToken();
-                if ( value_or_null == null ) {
-                    return error.unexpectedCharacter;
+    /// Main parsing entrypoint. 
+    pub fn parse(self: *Self, root_context: *ini.Table) !void {
+        self.root = root_context;
+        self.context = root_context;
+        while ( self.tokenizer.getToken() ) | token | {
+            switch ( token.tok_type ) {
+                .comment, .whitespace => { continue; },
+                .newline => {
+                    self.line_number += 1;
+                    continue;
+                },
+                .leftBracket => { 
+                    const is_array_path = self.tokenizer.lexer.match('[');
+                    if ( is_array_path ) self.tokenizer.getToken(); // skip [[
+                    try self._parseDottedPath(self.root);
+                },
+                .keyLike, .quotedString => {
+                    self.tokenizer.lexer.skipWhitespace();
+                    self.tokenizer.expectToken(.keyValSep);
+                    self.tokenizer.lexer.skipWhitespace();
+                    try self.root.entries.put(key.span, try self._parseValue());
+                },
+                else => {
+                    std.log.err("[TOML] Parsing error on line: {d} on token: {any}", .{ self.line_number, token });
+                    return error.unexpectedToken;
                 }
-                const value = value_or_null.?;
-                if ( value.tok_type == .quotedString ) {
-                    self.last_section 
-                }
-
-            },
-            .leftBracket => {
-                // if dotted -> we should build whole tree   
-                var top_level: *Section = self.createSection();
-                const top_token = try self.tokenizer.expectToken(.keyLike);
-                try output.entries.put(top_token.span, .{ .section = top_level});
-                var deepest_level: *Section = self.parseTableHeader(top_token, top_level);
-                self.last_section = deepest_level;
             }
         }
+        return;
     }
 
-    pub fn parseValue(self: *Self) !ini.Entry {
-        
-    }
-
-    pub fn createSection(self: *Self) !*ini.Section {
-        var section: *Section = try std.testing.allocator.create(Section);
-        section.* = Section.init(std.testing.allocator);
-        return section;
-    }
-
-
-    pub fn parse(self: *Self, output: *Ini) !void {
-        while ( self.tokenizer.getToken() ) | token | {
-            if ( token.tok_type == .whitespace or token.tok_type == .newline ) continue;
-            try self.parseExpression(token, output);
+    /// recursively traverse dotted path 
+    fn _parseDottedPath(self: *Self, ctx: *ini.Table) void {
+        const key_token = self.tokenizer.expectToken(.keyLike);
+        if ( self.tokenizer.lexer.match('.') ) {
+            var table = try self._createTable();
+            try ctx.entries.put(key_token.span, .{ .table = table });
+            return self._parseDottedPath(table);
+        } else if ( self.tokenizer.lexer.matchAndConsumeSlice("]]") ) {
+            // end of header of array
+            var array = try self._createArray();
+            var final_section = try self._createTable();
+            try array.entries.append(.{ .table = final_section });
+            self.context = final_section;
+            try ctx.entries.put(key_token.span, .{ .array = array });
+        } else if ( self.tokenizer.lexer.matchAndConsume(']') ) {
+            var final_section = try self._createTable();
+            self.context = final_section;
+            try ctx.entries.put(key_token.span, .{ .table = final_section });
         }
     }
+
+    fn _createArray(self: *Self) !*ini.Array {
+        var array: *ini.Array = try self.alloc.create(ini.Array);
+        array.* = ini.Array.init(self.alloc);
+        return array;
+    }
+    
+    fn _createTable(self: *Self) !*ini.Table {
+        var table: *ini.Table = try self.alloc.create(ini.Table);
+        table.* = ini.Table.init(self.alloc);
+        return table;
+    }
+
+    fn _parseValue(self: *Self) !ini.Entry {
+        const token = (try self.tokenizer.getToken()).?;
+        switch ( token.tok_type ) {
+            .quotedString => { 
+                return .{ .string = token.span };
+            },
+            .boolean => { 
+                if ( token.span[0] == 't' ) {
+                    return .{ .boolean = true };
+                } else {
+                    return .{ .boolean = false };
+                }
+            },
+            .double => {
+                return try self._parseNumber(token);
+            },
+            .leftBrace => {
+                return try self._parseInlineTable();
+            },
+            .leftBracket => {
+                return try self._parseInlineArray();
+            }
+        }
+        // numbers 
+        // boolean
+        // datetime
+        // inline-array
+        // inline-Table
+    }
+
+    fn _parseInlineArray(self: *Self, array: *ini.Array) !void {
+        // [
+        try self._parseValue();
+        self.tokenizer.lexer.skipWhitespace();
+        if (self.tokenizer.lexer.matchAndConsume(',')) { 
+            try array.entries.append(try self._parseValue());
+        } else if ( self.tokenizer.lexer.matchAndConsume(']') ) {
+            return;
+        }
+    }
+
+    fn _parseInlineTable(self: *Self) !void {
+        // {
+        self.tokenizer._parseKeyVal();
+    }
+    
 };
