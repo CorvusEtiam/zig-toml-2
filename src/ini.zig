@@ -1,9 +1,9 @@
 const std = @import("std");
 const IniParser = @import("./parser.zig").IniParser;
 // entries
-// entry can be iter section or key 
+// entry can be iter table or key 
 
-
+// Root of new parser file
 pub const Config = struct {
     const Self = @This();
     entries: std.StringHashMap(Entry) = undefined,
@@ -20,9 +20,9 @@ pub const Config = struct {
         var value_iterator = self.entries.valueIterator();
         while ( value_iterator.next() ) | value | {
             switch ( value.* ) {
-                Entry.section => | section | {
-                    section.deinit();
-                    self.alloc.destroy(section);
+                Entry.table => | table | {
+                    table.deinit();
+                    self.alloc.destroy(table);
                 },
                 else => { }
             }
@@ -50,7 +50,33 @@ pub const Config = struct {
     }
 };
 
-pub const Section = struct {
+// Array datatype for both inline arrays and normal [[array]]
+pub const Array = struct {
+    const Self = @This();
+    alloc: *std.mem.Allocator = undefined,
+    entries: std.ArrayList(Entry) = undefined,
+    
+    pub fn init(alloc: *std.mem.Allocator) !Self {
+        return .{
+            .alloc = alloc,
+            .entries = std.ArrayList(Entry).init(alloc),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        for ( self.entries.items() ) | value | {
+            switch ( value ) {
+                Entry.table => | table | {
+                    table.deinit();
+                    self.alloc.destroy(table);
+                },
+                else => { }
+            }
+        }
+    }
+};
+// Dictionary data type for objects, inline objects
+pub const Table = struct {
     const Self = @This();
     entries: std.StringHashMap(Entry) = undefined,
     alloc: *std.mem.Allocator = undefined,
@@ -66,9 +92,9 @@ pub const Section = struct {
         var value_iterator = self.entries.valueIterator();
         while ( value_iterator.next() ) | value | {
             switch ( value.* ) {
-                Entry.section => | section | {
-                    section.deinit();
-                    self.alloc.destroy(section);
+                Entry.table => | table | {
+                    table.deinit();
+                    self.alloc.destroy(table);
                 },
                 else => { }
             }
@@ -82,17 +108,18 @@ pub const Entry = union(enum) {
     double: f64,
     boolean: bool,
     string: []const u8,
-    section: *Section,
+    table: *Table,
+    array: *Array,
 };
 
 
 fn iniTest() !Config {
     var config : Config = Config.init(std.testing.allocator);
-    var section: *Section = try std.testing.allocator.create(Section);
-    section.* = Section.init(std.testing.allocator);
-    try section.entries.put("name", .{ .string = "Unique Player Name" });
-    try section.entries.put("hp", .{ .double = 100.0 });   
-    try config.entries.put("player", .{ .section = section });
+    var table: *table = try std.testing.allocator.create(table);
+    table.* = table.init(std.testing.allocator);
+    try table.entries.put("name", .{ .string = "Unique Player Name" });
+    try table.entries.put("hp", .{ .double = 100.0 });   
+    try config.entries.put("player", .{ .table = table });
     return config;
 }
 
@@ -100,9 +127,9 @@ fn iniTest() !Config {
 test "Build Ini File" {
     var config = try iniTest();
     defer config.deinit();
-    const main_section = config.entries.get("player");
-    try std.testing.expect(main_section != null);
-    if ( main_section ) | main | {
-        try std.testing.expectEqual(main.section.entries.get("hp").?.double, 100.0);
+    const main_table = config.entries.get("player");
+    try std.testing.expect(main_table != null);
+    if ( main_table ) | main | {
+        try std.testing.expectEqual(main.table.entries.get("hp").?.double, 100.0);
     }
 }
